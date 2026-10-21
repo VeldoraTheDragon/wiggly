@@ -2,7 +2,7 @@
 
 import GLib from 'gi://GLib';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
-import { getPointerWatcher } from 'resource:///org/gnome/shell/ui/pointerWatcher.js';
+import { getPointerWatcher } from "./pointerwatcher.js"
 
 import { Field } from './const.js';
 import Effect from './effect.js';
