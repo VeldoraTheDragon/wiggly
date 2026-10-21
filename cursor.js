@@ -56,7 +56,7 @@ export default class Cursor {
     }
 
     show() {
-        const seat = Clutter.get_default_backend().get_default_seat();
+        const seat = global.stage.context.get_backend().get_default_seat();
 
         if (this._unfocusInhibited) {
             seat.uninhibit_unfocus();
@@ -67,7 +67,7 @@ export default class Cursor {
     }
 
     hide() {
-        const seat = Clutter.get_default_backend().get_default_seat();
+        const seat = global.stage.context.get_backend().get_default_seat();
 
         if (!this._unfocusInhibited) {
             seat.inhibit_unfocus();
