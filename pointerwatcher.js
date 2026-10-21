@@ -1,19 +1,22 @@
 import GLib from 'gi://GLib';
 
-let pointerWatcher = null;
+// We stop polling if the user is idle for more than this amount of time
+const IDLE_TIME = 1000;
+
+// This file implements a reasonably efficient system for tracking the position
+// of the mouse pointer. We simply query the pointer from the X server in a loop,
+// but we turn off the polling when the user is idle.
+
+let _pointerWatcher = null;
 
 /**
- * Return a pointer watcher that works before and after GNOME Shell 51.
- *
- * GNOME Shell 51 removed its private pointerWatcher.js module in favour of
- * Meta.CursorTracker's position-invalidated signal. Older Shell releases do
- * not expose that signal, so use the former polling behaviour as a fallback.
- *
  * @returns {PointerWatcher}
  */
 export function getPointerWatcher() {
-    pointerWatcher ??= new PointerWatcher();
-    return pointerWatcher;
+    if (_pointerWatcher == null)
+        _pointerWatcher = new PointerWatcher();
+
+    return _pointerWatcher;
 }
 
 class PointerWatch {
@@ -23,6 +26,9 @@ class PointerWatch {
         this.callback = callback;
     }
 
+    // remove:
+    // remove this watch. This function may safely be called
+    // while the callback is executing.
     remove() {
         this.watcher._removeWatch(this);
     }
@@ -30,99 +36,90 @@ class PointerWatch {
 
 class PointerWatcher {
     constructor() {
+        this._idleMonitor = global.backend.get_core_idle_monitor();
+        this._idleMonitor.add_idle_watch(IDLE_TIME, this._onIdleMonitorBecameIdle.bind(this));
+        this._idle = this._idleMonitor.get_idletime() > IDLE_TIME;
         this._watches = [];
-        this._cursorTracker = null;
-        this._positionInvalidatedId = 0;
-        this._timeoutId = 0;
-        this._pointerX = null;
-        this._pointerY = null;
+        this.pointerX = null;
+        this.pointerY = null;
     }
 
+    // addWatch:
+    // @interval: hint as to the time resolution needed. When the user is
+    //   not idle, the position of the pointer will be queried at least
+    //   once every this many milliseconds.
+    // @callback to call when the pointer position changes - takes
+    //   two arguments, X and Y.
+    //
+    // Set up a watch on the position of the mouse pointer. Returns a
+    // PointerWatch object which has a remove() method to remove the watch.
     addWatch(interval, callback) {
-        // Avoid calling a new watch for the pointer's current position.
+        // Avoid unreliably calling the watch for the current position
         this._updatePointer();
 
         const watch = new PointerWatch(this, interval, callback);
         this._watches.push(watch);
-        this._updateSource();
+        this._updateTimeout();
         return watch;
     }
 
     _removeWatch(watch) {
-        const index = this._watches.indexOf(watch);
-        if (index === -1)
-            return;
-
-        this._watches.splice(index, 1);
-        this._updateSource();
+        for (let i = 0; i < this._watches.length; i++) {
+            if (this._watches[i] === watch) {
+                this._watches.splice(i, 1);
+                this._updateTimeout();
+                return;
+            }
+        }
     }
 
-    _updateSource() {
-        this._removeSource();
-        if (this._watches.length === 0)
-            return;
-
-        // This is the GNOME Shell 51 path. Connecting can fail on older
-        // releases where CursorTracker does not yet expose this signal.
-        try {
-            this._cursorTracker = global.backend.get_cursor_tracker();
-            this._positionInvalidatedId = this._cursorTracker.connect(
-                'position-invalidated', () => this._updatePointer());
-            return;
-        } catch {
-            this._cursorTracker = null;
-            this._positionInvalidatedId = 0;
-        }
-
-        const interval = Math.min(...this._watches.map(watch => watch.interval));
-        this._timeoutId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
-            interval,
-            () => {
-                this._updatePointer();
-                return GLib.SOURCE_CONTINUE;
-            });
-        GLib.Source.set_name_by_id(
-            this._timeoutId, '[paperwm] pointer watcher');
+    _onIdleMonitorBecameActive() {
+        this._idle = false;
+        this._updatePointer();
+        this._updateTimeout();
     }
 
-    _removeSource() {
-        if (this._positionInvalidatedId) {
-            this._cursorTracker.disconnect(this._positionInvalidatedId);
-            this._positionInvalidatedId = 0;
-        }
+    _onIdleMonitorBecameIdle() {
+        this._idle = true;
+        this._idleMonitor.add_user_active_watch(this._onIdleMonitorBecameActive.bind(this));
+        this._updateTimeout();
+    }
 
-        this._cursorTracker = null;
-
+    _updateTimeout() {
         if (this._timeoutId) {
             GLib.source_remove(this._timeoutId);
             this._timeoutId = 0;
         }
+
+        if (this._idle || this._watches.length === 0)
+            return;
+
+        let minInterval = this._watches[0].interval;
+        for (let i = 1; i < this._watches.length; i++)
+            minInterval = Math.min(this._watches[i].interval, minInterval);
+
+        this._timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, minInterval,
+            this._onTimeout.bind(this));
+        GLib.Source.set_name_by_id(this._timeoutId, '[gnome-shell] this._onTimeout');
     }
 
-    _getPointer() {
-        if (this._cursorTracker) {
-            const [point] = this._cursorTracker.get_pointer();
-            return [point.x, point.y];
-        }
-
-        return global.get_pointer();
+    _onTimeout() {
+        this._updatePointer();
+        return GLib.SOURCE_CONTINUE;
     }
 
     _updatePointer() {
-        const [x, y] = this._getPointer();
-        if (this._pointerX === x && this._pointerY === y)
+        const [x, y] = global.get_pointer();
+        if (this.pointerX === x && this.pointerY === y)
             return;
 
-        this._pointerX = x;
-        this._pointerY = y;
+        this.pointerX = x;
+        this.pointerY = y;
 
-        // A callback may remove itself, so only advance while the same watch
-        // remains at the current index.
         for (let i = 0; i < this._watches.length;) {
             const watch = this._watches[i];
             watch.callback(x, y);
-            if (watch === this._watches[i])
+            if (watch === this._watches[i]) // guard against self-removal
                 i++;
         }
     }
